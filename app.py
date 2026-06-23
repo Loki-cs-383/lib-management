@@ -27,13 +27,26 @@ else:
     def get_db_connection():
         return pymysql.connect(**db_config)
 
+def _execute(cursor, query, params):
+    """Execute query with correct placeholder style for SQLite vs MySQL.
+    Assumes query uses MySQL-style %s placeholders (as in the original schema).
+    For SQLite, converts %s to ? before execution.
+    """
+    if isinstance(cursor.connection, sqlite3.Connection):
+        # SQLite: replace %s with ?
+        q = query.replace('%s', '?')
+        return cursor.execute(q, params)
+    else:
+        # MySQL / pymysql: keep %s as-is
+        return cursor.execute(query, params)
+
 def init_db():
     """Initialize database with tables if they don't exist"""
     conn = get_db_connection()
     cursor = conn.cursor()
 
     # Create tables (same schema as your schema.sql)
-    cursor.execute('''
+    _execute(cursor, ('''
         CREATE TABLE IF NOT EXISTS members (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             name VARCHAR(100) NOT NULL,
@@ -42,9 +55,9 @@ def init_db():
             join_date DATE NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
+    '''), ())
 
-    cursor.execute('''
+    _execute(cursor, ('''
         CREATE TABLE IF NOT EXISTS books (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             title VARCHAR(200) NOT NULL,
@@ -55,9 +68,9 @@ def init_db():
             total_copies INT NOT NULL DEFAULT 1,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
-    ''')
+    '''), ())
 
-    cursor.execute('''
+    _execute(cursor, ('''
         CREATE TABLE IF NOT EXISTS transactions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             book_id INT NOT NULL,
@@ -70,23 +83,32 @@ def init_db():
             FOREIGN KEY (book_id) REFERENCES books(id),
             FOREIGN KEY (member_id) REFERENCES members(id)
         )
-    ''')
+    '''), ())
 
     # Insert sample data only if tables are empty
-    cursor.execute('SELECT COUNT(*) FROM members')
+    _execute(cursor, ('SELECT COUNT(*) FROM members'), ())
     if cursor.fetchone()[0] == 0:
-        cursor.execute('''
+        _execute(cursor, ('''
             INSERT INTO members (name, email, phone, join_date) VALUES
-            ('John Doe', 'john@example.com', '1234567890', '2023-01-15'),
-            ('Jane Smith', 'jane@example.com', '0987654321', '2023-02-20')
-        ''')
+            (%s, %s, %s, %s),
+            (%s, %s, %s, %s)
+        '''), (
+            'John Doe', 'john@example.com', '1234567890', '2023-01-15',
+            'Jane Smith', 'jane@example.com', '0987654321', '2023-02-20'
+        ))
 
-        cursor.execute('''
-            INSERT INTO books (title, author, isbn, publication_year, available_copies, total_copies) VALUES
-            ('The Great Gatsby', 'F. Scott Fitzgerald', '9780743273565', 1925, 3, 3),
-            ('To Kill a Mockingbird', 'Harper Lee', '9780061120084', 1960, 2, 2),
-            ('1984', 'George Orwell', '9780451524935', 1949, 4, 4)
-        ''')
+    _execute(cursor, ('SELECT COUNT(*) FROM books'), ())
+    if cursor.fetchone()[0] == 0:
+        _execute(cursor, ('''
+            INSERT INTO books (title, author, isbn, publication_year, total_copies, available_copies) VALUES
+            (%s, %s, %s, %s, %s, %s),
+            (%s, %s, %s, %s, %s, %s),
+            (%s, %s, %s, %s, %s, %s)
+        '''), (
+            'The Great Gatsby', 'F. Scott Fitzgerald', '9780743273565', 1925, 3, 3,
+            'To Kill a Mockingbird', 'Harper Lee', '9780061120084', 1960, 2, 2,
+            '1984', 'George Orwell', '9780451524935', 1949, 4, 4
+        ))
 
     conn.commit()
     conn.close()
@@ -95,7 +117,12 @@ def init_db():
 with app.app_context():
     init_db()
 
-# Home page
+# Helper to convert None to empty string for display (optional)
+def _nullsafe(val):
+    return '' if val is None else val
+
+# ------------------- Routes -------------------
+
 @app.route('/')
 def index():
     return render_template('index.html')
@@ -105,7 +132,7 @@ def index():
 def books():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM books')
+    _execute(cursor, ('SELECT * FROM books'), ())
     books = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -123,13 +150,14 @@ def add_book():
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                'INSERT INTO books (title, author, isbn, publication_year, total_copies, available_copies) VALUES (%s, %s, %s, %s, %s, %s)',
-                (title, author, isbn, publication_year, total_copies, total_copies)
-            )
+            _execute(cursor, (
+                'INSERT INTO books (title, author, isbn, publication_year, total_copies, available_copies) '
+                'VALUES (%s, %s, %s, %s, %s, %s)'
+            ), (title, author, isbn, publication_year, total_copies, total_copies))
             conn.commit()
             flash('Book added successfully!', 'success')
         except Exception as e:
+            conn.rollback()
             flash(f'Error adding book: {str(e)}', 'danger')
         finally:
             cursor.close()
@@ -142,7 +170,6 @@ def add_book():
 def edit_book(id):
     conn = get_db_connection()
     cursor = conn.cursor()
-
     if request.method == 'POST':
         title = request.form['title']
         author = request.form['author']
@@ -150,25 +177,34 @@ def edit_book(id):
         publication_year = request.form['publication_year']
         total_copies = request.form['total_copies']
 
-        cursor.execute(
-            'UPDATE books SET title=%s, author=%s, isbn=%s, publication_year=%s, total_copies=%s WHERE id=%s',
-            (title, author, isbn, publication_year, total_copies, id)
-        )
-        # Update available copies based on difference in total copies
-        cursor.execute('SELECT available_copies, total_copies FROM books WHERE id=%s', (id,))
-        book = cursor.fetchone()
-        if book:
-            diff = int(total_copies) - book['total_copies']
-            new_available = book['available_copies'] + diff
-            if new_available < 0:
-                new_available = 0
-            cursor.execute('UPDATE books SET available_copies=%s WHERE id=%s', (new_available, id))
-        conn.commit()
-        flash('Book updated successfully!', 'success')
+        try:
+            # Get current total copies to compute delta
+            _execute(cursor, ('SELECT available_copies, total_copies FROM books WHERE id=%s'), (id,))
+            book = cursor.fetchone()
+            if book:
+                diff = int(total_copies) - book['total_copies']
+                new_available = book['available_copies'] + diff
+                if new_available < 0:
+                    new_available = 0
+
+                _execute(cursor, (
+                    'UPDATE books SET title=%s, author=%s, isbn=%s, publication_year=%s, total_copies=%s WHERE id=%s'
+                ), (title, author, isbn, publication_year, total_copies, id))
+                _execute(cursor, ('UPDATE books SET available_copies=%s WHERE id=%s'), (new_available, id))
+                conn.commit()
+                flash('Book updated successfully!', 'success')
+            else:
+                flash('Book not found!', 'danger')
+        except Exception as e:
+            conn.rollback()
+            flash(f'Error updating book: {str(e)}', 'danger')
+        finally:
+            cursor.close()
+            conn.close()
         return redirect(url_for('books'))
 
     # GET request
-    cursor.execute('SELECT * FROM books WHERE id=%s', (id,))
+    _execute(callback, ('SELECT * FROM books WHERE id=%s'), (id,))
     book = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -179,16 +215,17 @@ def delete_book(id):
     conn = get_db_connection()
     cursor = conn.cursor()
     try:
-        # Check if book is issued
-        cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE book_id=%s AND return_date IS NULL', (id,))
+        # Check if book is currently issued
+        _execute(cursor, ('SELECT COUNT(*) as count FROM transactions WHERE book_id=%s AND return_date IS NULL'), (id,))
         result = cursor.fetchone()
         if result['count'] > 0:
             flash('Cannot delete book that is currently issued!', 'danger')
         else:
-            cursor.execute('DELETE FROM books WHERE id=%s', (id,))
+            _execute(cursor, ('DELETE FROM books WHERE id=%s'), (id,))
             conn.commit()
             flash('Book deleted successfully!', 'success')
     except Exception as e:
+        conn.rollback()
         flash(f'Error deleting book: {str(e)}', 'danger')
     finally:
         cursor.close()
@@ -200,7 +237,7 @@ def delete_book(id):
 def members():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT * FROM members')
+    _execute(cursor, ('SELECT * FROM members'), ())
     members = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -217,13 +254,13 @@ def add_member():
         conn = get_db_connection()
         cursor = conn.cursor()
         try:
-            cursor.execute(
-                'INSERT INTO members (name, email, phone, join_date) VALUES (%s, %s, %s, %s)',
-                (name, email, phone, join_date)
-            )
+            _execute(cursor, (
+                'INSERT INTO members (name, email, phone, join_date) VALUES (%s, %s, %s, %s)'
+            ), (name, email, phone, join_date))
             conn.commit()
             flash('Member added successfully!', 'success')
         except Exception as e:
+            conn.rollback()
             flash(f'Error adding member: {str(e)}', 'danger')
         finally:
             cursor.close()
@@ -236,23 +273,28 @@ def add_member():
 def edit_member(id):
     conn = get_db_connection()
     cursor = conn.cursor()
-
     if request.method == 'POST':
         name = request.form['name']
         email = request.form['email']
         phone = request.form['phone']
         join_date = request.form['join_date']
 
-        cursor.execute(
-            'UPDATE members SET name=%s, email=%s, phone=%s, join_date=%s WHERE id=%s',
-            (name, email, phone, join_date, id)
-        )
-        conn.commit()
-        flash('Member updated successfully!', 'success')
+        try:
+            _execute(cursor, (
+                'UPDATE members SET name=%s, email=%s, phone=%s, join_date=%s WHERE id=%s'
+            ), (name, email, phone, join_date, id))
+            conn.commit()
+            flash('Member updated successfully!', 'success')
+        except Exception as e:
+            conn.rollback()
+            flash(f'Error updating member: {str(e)}', 'danger')
+        finally:
+            cursor.close()
+            conn.close()
         return redirect(url_for('members'))
 
     # GET request
-    cursor.execute('SELECT * FROM members WHERE id=%s', (id,))
+    _execute(cursor, ('SELECT * FROM members WHERE id=%s'), (id,))
     member = cursor.fetchone()
     cursor.close()
     conn.close()
@@ -264,15 +306,16 @@ def delete_member(id):
     cursor = conn.cursor()
     try:
         # Check if member has any issued books
-        cursor.execute('SELECT COUNT(*) as count FROM transactions WHERE member_id=%s AND return_date IS NULL', (id,))
+        _execute(cursor, ('SELECT COUNT(*) as count FROM transactions WHERE member_id=%s AND return_date IS NULL'), (id,))
         result = cursor.fetchone()
         if result['count'] > 0:
             flash('Cannot delete member who has issued books!', 'danger')
         else:
-            cursor.execute('DELETE FROM members WHERE id=%s', (id,))
+            _execute(cursor, ('DELETE FROM members WHERE id=%s'), (id,))
             conn.commit()
             flash('Member deleted successfully!', 'success')
     except Exception as e:
+        conn.rollback()
         flash(f'Error deleting member: {str(e)}', 'danger')
     finally:
         cursor.close()
@@ -284,13 +327,13 @@ def delete_member(id):
 def transactions():
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('''
-        SELECT t.*, b.title, m.name
+    _execute(cursor, ('''
+        SELECT t.id, b.title, m.name, t.issue_date, t.due_date, t.return_date, t.fine
         FROM transactions t
         JOIN books b ON t.book_id = b.id
         JOIN members m ON t.member_id = m.id
         ORDER BY t.issue_date DESC
-    ''')
+    '''), ())
     transactions = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -311,25 +354,22 @@ def issue_book():
         cursor = conn.cursor()
         try:
             # Check book availability
-            cursor.execute('SELECT available_copies FROM books WHERE id=%s', (book_id,))
+            _execute(cursor, ('SELECT available_copies FROM books WHERE id=%s'), (book_id,))
             book = cursor.fetchone()
             if not book or book['available_copies'] <= 0:
                 flash('Book is not available for issue!', 'danger')
                 return redirect(url_for('issue_book'))
 
             # Create transaction
-            cursor.execute(
-                'INSERT INTO transactions (book_id, member_id, issue_date, due_date) VALUES (%s, %s, %s, %s)',
-                (book_id, member_id, issue_date, due_date_str)
-            )
+            _execute(cursor, (
+                'INSERT INTO transactions (book_id, member_id, issue_date, due_date) VALUES (%s, %s, %s, %s)'
+            ), (book_id, member_id, issue_date, due_date_str))
             # Update book available copies
-            cursor.execute(
-                'UPDATE books SET available_copies = available_copies - 1 WHERE id=%s',
-                (book_id,)
-            )
+            _execute(cursor, ('UPDATE books SET available_copies = available_copies - 1 WHERE id=%s'), (book_id,))
             conn.commit()
             flash('Book issued successfully!', 'success')
         except Exception as e:
+            conn.rollback()
             flash(f'Error issuing book: {str(e)}', 'danger')
         finally:
             cursor.close()
@@ -339,9 +379,9 @@ def issue_book():
     # GET request: show form with available books and members
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id, title FROM books WHERE available_copies > 0')
+    _execute(cursor, ('SELECT id, title FROM books WHERE available_copies > 0'), ())
     books = cursor.fetchall()
-    cursor.execute('SELECT id, name FROM members')
+    _execute(cursor, ('SELECT id, name FROM members'), ())
     members = cursor.fetchall()
     cursor.close()
     conn.close()
@@ -349,69 +389,77 @@ def issue_book():
 
 @app.route('/return_book/<int:id>', methods=['GET', 'POST'])
 def return_book(id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-
     if request.method == 'POST':
         return_date = request.form['return_date']
 
-        # Calculate fine if any (e.g., $0.50 per day overdue)
-        cursor.execute('''
-            SELECT t.*, b.title, m.name
-            FROM transactions t
-            JOIN books b ON t.book_id = b.id
-            JOIN members m ON t.member_id = m.id
-            WHERE t.id=%s
-        ''', (id,))
-        transaction = cursor.fetchone()
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        try:
+            # Get transaction details
+            _execute(cursor, ('SELECT book_id, due_date FROM transactions WHERE id=%s'), (id,))
+            transaction = cursor.fetchone()
+            if not transaction:
+                flash('Transaction not found!', 'danger')
+                return redirect(url_for('transactions'))
 
-        if transaction:
-            # Handle due_date which might be a string or date object
-            due_date = transaction['due_date']
-            if isinstance(due_date, str):
-                due_date = datetime.strptime(due_date, '%Y-%m-%d').date()
-            elif hasattr(due_date, 'date'):
-                due_date = due_date.date()
-
-            # Handle return_date from form (always a string)
-            return_date_obj = datetime.strptime(return_date, '%Y-%m-%d').date()
-            days_overdue = (return_date_obj - due_date).days
-            fine = max(0, days_overdue * 0.50)  # $0.50 per day
+            # Calculate fine if overdue
+            due_date = datetime.strptime(transaction['due_date'], '%Y-%m-%d')
+            return_date_obj = datetime.strptime(return_date, '%Y-%m-%d')
+            fine = 0.0
+            if return_date_obj > due_date:
+                days_late = (return_date_obj - due_date).days
+                fine = days_late * 0.50  # $0.50 per day late
 
             # Update transaction
-            cursor.execute(
-                'UPDATE transactions SET return_date=%s, fine=%s WHERE id=%s',
-                (return_date, fine, id)
-            )
-            # Update book available copies
-            cursor.execute(
-                'UPDATE books SET available_copies = available_copies + 1 WHERE id=%s',
-                (transaction['book_id'],)
-            )
+            _execute(cursor, (
+                'UPDATE transactions SET return_date=%s, fine=%s WHERE id=%s'
+            ), (return_date, f"{fine:.2f}", id))
+            # Increase book available copies
+            _execute(cursor, ('UPDATE books SET available_copies = available_copies + 1 WHERE id=%s'), (transaction['book_id'],))
             conn.commit()
-            flash(f'Book returned successfully! Fine: ${fine:.2f}', 'success')
-        else:
-            flash('Transaction not found!', 'danger')
-
-        cursor.close()
-        conn.close()
+            flash(f'Book returned successfully! Fine: ${float(fine):.2f}', 'success')
+        except Exception as e:
+            conn.rollback()
+            flash(f'Error returning book: {str(e)}', 'danger')
+        finally:
+            cursor.close()
+            conn.close()
         return redirect(url_for('transactions'))
 
     # GET request: show return form
-    cursor.execute('''
-        SELECT t.*, b.title, m.name
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    _execute(cursor, ('''
+        SELECT t.id, b.title, m.name, t.issue_date, t.due_date
         FROM transactions t
         JOIN books b ON t.book_id = b.id
         JOIN members m ON t.member_id = m.id
         WHERE t.id=%s AND t.return_date IS NULL
-    ''', (id,))
+    '''), (id,))
     transaction = cursor.fetchone()
     cursor.close()
     conn.close()
     if not transaction:
-        flash('No such active transaction!', 'danger')
+        flash('No active transaction found with that ID!', 'danger')
         return redirect(url_for('transactions'))
     return render_template('return_book.html', transaction=transaction)
+
+# Optional: reset database (for testing only)
+@app.route('/reset_db')
+def reset_db():
+    if not os.environ.get('RENDER'):  # Only allow locally
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('DROP TABLE IF EXISTS transactions')
+        cursor.execute('DROP TABLE IF EXISTS books')
+        cursor.execute('DROP TABLE IF EXISTS members')
+        conn.commit()
+        conn.close()
+        init_db()
+        flash('Database reset successfully!', 'success')
+    else:
+        flash('Operation not allowed in production.', 'warning')
+    return redirect(url_for('index'))
 
 if __name__ == '__main__':
     app.run(debug=True)
