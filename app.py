@@ -1,31 +1,99 @@
 from flask import Flask, render_template, request, redirect, url_for, flash
-import pymysql
+import os
+import sqlite3
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
-app.secret_key = 'your_secret_key_here'  # Change this in production
+app.secret_key = os.environ.get('SECRET_KEY', 'dev-secret-key-change-in-production')
 
+# Database configuration - uses SQLite in production (Render), MySQL locally
+if os.environ.get('RENDER'):  # Render sets this environment variable
+    # Production: Use SQLite file on persistent disk
+    DB_PATH = os.path.join(os.getenv('RENDER_DISK_PATH', '/tmp'), 'library.db')
+    def get_db_connection():
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row  # To mimic DictCursor behavior
+        return conn
+else:
+    # Development: Use MySQL
+    import pymysql
+    db_config = {
+        'host': 'localhost',
+        'user': 'root',
+        'password': '1234',  # Only used locally - change as needed
+        'database': 'library',
+        'cursorclass': pymysql.cursors.DictCursor
+    }
+    def get_db_connection():
+        return pymysql.connect(**db_config)
 
-# Database configuration using DATABASE_URL (PostgreSQL)
-import os
-import psycopg2
-from urllib.parse import urlparse
+def init_db():
+    """Initialize database with tables if they don't exist"""
+    conn = get_db_connection()
+    cursor = conn.cursor()
 
-DATABASE_URL = os.getenv(\"DATABASE_URL\")
-if not DATABASE_URL:
-    raise Exception(\"DATABASE_URL environment variable not set\")
-result = urlparse(DATABASE_URL)
-db_config = {
-    \"dbname\":   result.path[1:],
-    \"user\":     result.username,
-    \"password\": result.password,
-    \"host\":     result.hostname,
-    \"port\":     result.port
-}
+    # Create tables (same schema as your schema.sql)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS members (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name VARCHAR(100) NOT NULL,
+            email VARCHAR(100) UNIQUE NOT NULL,
+            phone VARCHAR(20),
+            join_date DATE NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
 
-def get_db_connection():
-    return psycopg2.connect(**db_config)
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS books (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title VARCHAR(200) NOT NULL,
+            author VARCHAR(100) NOT NULL,
+            isbn VARCHAR(20) UNIQUE NOT NULL,
+            publication_year YEAR,
+            available_copies INT NOT NULL DEFAULT 1,
+            total_copies INT NOT NULL DEFAULT 1,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
 
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS transactions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            book_id INT NOT NULL,
+            member_id INT NOT NULL,
+            issue_date DATE NOT NULL,
+            due_date DATE NOT NULL,
+            return_date DATE,
+            fine DECIMAL(5,2) DEFAULT 0.00,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (book_id) REFERENCES books(id),
+            FOREIGN KEY (member_id) REFERENCES members(id)
+        )
+    ''')
+
+    # Insert sample data only if tables are empty
+    cursor.execute('SELECT COUNT(*) FROM members')
+    if cursor.fetchone()[0] == 0:
+        cursor.execute('''
+            INSERT INTO members (name, email, phone, join_date) VALUES
+            ('John Doe', 'john@example.com', '1234567890', '2023-01-15'),
+            ('Jane Smith', 'jane@example.com', '0987654321', '2023-02-20')
+        ''')
+
+        cursor.execute('''
+            INSERT INTO books (title, author, isbn, publication_year, available_copies, total_copies) VALUES
+            ('The Great Gatsby', 'F. Scott Fitzgerald', '9780743273565', 1925, 3, 3),
+            ('To Kill a Mockingbird', 'Harper Lee', '9780061120084', 1960, 2, 2),
+            ('1984', 'George Orwell', '9780451524935', 1949, 4, 4)
+        ''')
+
+    conn.commit()
+    conn.close()
+
+# Initialize database when app starts
+with app.app_context():
+    init_db()
 
 # Home page
 @app.route('/')
